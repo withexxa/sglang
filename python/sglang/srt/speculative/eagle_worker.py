@@ -428,6 +428,10 @@ class EAGLEWorker(TpModelWorker):
                 #  "x" means speculative draft tokens
                 #  "." means padded tokens
 
+                # Note: The implementation seems to not be that optimized. Maybe we can
+                # get away for seagle with doing simplified implementation.?
+                # TODO: Investigate more thoroughly.
+
                 # TODO(lmzheng): The current implementation is still a fake support
                 # for page size > 1. In the `assign_draft_cache_locs` below,
                 # we directly move the indices instead of the real kv cache.

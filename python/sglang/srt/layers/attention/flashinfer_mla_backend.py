@@ -824,7 +824,9 @@ class FlashInferMLAMultiStepDraftBackend:
 
         assert forward_batch.spec_info is not None
         assert isinstance(forward_batch.spec_info, EagleDraftInput)
-
+        # Note: Here the forward step for the tree computation happens
+        # TODO: find a way to change the RoPE for the tree computation for Seagle?
+        # TODO: implement the attention sink there ?
         for i in range(self.speculative_num_steps - 1):
             forward_batch.spec_info.kv_indptr = self.kv_indptr[i, : bs + 1]
             forward_batch.spec_info.kv_indices = kv_indices_buffer[i][

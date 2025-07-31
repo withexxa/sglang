@@ -2020,11 +2020,18 @@ class FlashAttentionBackend(AttentionBackend):
 
 
 class FlashAttentionSinkBackend(FlashAttentionBackend):
-    def __init__(self, model_runner: ModelRunner, topk: int, speculative_num_steps: int):
-        super().__init__(model_runner, topk, speculative_num_steps)
+    def __init__(        
+        self,
+        model_runner: ModelRunner,
+        skip_prefill: bool = False,
+        speculative_step_id=0,
+        topk=0,
+        speculative_num_steps=0,
+):
+        super().__init__(model_runner, skip_prefill, speculative_step_id, topk, speculative_num_steps)
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
-        pass
+        super().init_forward_metadata(forward_batch)
 
     def init_cuda_graph_state(self, max_bs: int, max_num_tokens: int):
         raise NotImplementedError("FlashAttentionSinkBackend does not support CUDA graph")
@@ -2039,7 +2046,7 @@ class FlashAttentionSinkBackend(FlashAttentionBackend):
         raise NotImplementedError("FlashAttentionSinkBackend does not support CUDA graph")
 
     def forward_extend(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, layer: RadixAttention, forward_batch: ForwardBatch, save_kv_cache=True, q_rope: Optional[torch.Tensor] = None, k_rope: Optional[torch.Tensor] = None):
-        pass
+        raise NotImplementedError("FlashAttentionSinkBackend does not support forward_extend")
 
     def forward_decode(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, layer: RadixAttention, forward_batch: ForwardBatch, save_kv_cache=True, q_rope: Optional[torch.Tensor] = None, k_rope: Optional[torch.Tensor] = None):
         if k is not None:
@@ -2290,7 +2297,7 @@ class FlashAttentionMultiStepBackend:
         self.speculative_num_steps = speculative_num_steps
         self.attn_backends = []
         for i in range(self.speculative_num_steps):
-            back = FlashAttentionBackend if (not self.attention_sink and i == 0) else FlashAttentionSinkBackend
+            back = FlashAttentionSinkBackend if attention_sink and i == 0 else FlashAttentionBackend
             self.attn_backends.append(
                 back(
                     model_runner,

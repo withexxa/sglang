@@ -176,6 +176,10 @@ class EAGLEWorker(TpModelWorker):
 
         self.has_prefill_wrapper_verify = False
         self.draft_extend_attn_backend = None
+        # if self.speculative_algorithm.is_seagle() and self.server_args.attention_backend != "fa3":
+        #     raise ValueError(
+        #         f"SEAGLE is not supported in attention backend {self.server_args.attention_backend}, only fa3 is supported"
+        #     )
 
         if self.server_args.attention_backend == "flashinfer":
             if not global_server_args_dict["use_mla_backend"]:
@@ -234,6 +238,7 @@ class EAGLEWorker(TpModelWorker):
                 self.draft_model_runner,
                 self.topk,
                 self.speculative_num_steps,
+                attention_sink=False, #self.speculative_algorithm.is_seagle(),
             )
             self.draft_extend_attn_backend = FlashAttentionBackend(
                 self.draft_model_runner,

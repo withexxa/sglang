@@ -2020,7 +2020,7 @@ class FlashAttentionBackend(AttentionBackend):
 
 
 class FlashAttentionSinkBackend(FlashAttentionBackend):
-    def __init__(        
+    def __init__(
         self,
         model_runner: ModelRunner,
         skip_prefill: bool = False,

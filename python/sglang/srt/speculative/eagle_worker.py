@@ -185,6 +185,7 @@ class EAGLEWorker(TpModelWorker):
             if not global_server_args_dict["use_mla_backend"]:
                 from sglang.srt.layers.attention.flashinfer_backend import (
                     FlashInferAttnBackend,
+                    FlashInferAttnSinkBackend,
                     FlashInferMultiStepDraftBackend,
                 )
 

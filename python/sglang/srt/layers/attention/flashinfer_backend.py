@@ -579,6 +579,253 @@ class FlashInferAttnBackend(AttentionBackend):
 
         raise ValueError(f"Unknown dispatch reason: {self.dispatch_reason}")
 
+class FlashInferAttnSinkBackend(FlashInferAttnBackend):
+    def __init__(
+        self,
+        model_runner: ModelRunner,
+        skip_prefill: bool = False,
+        kv_indptr_buf: Optional[torch.Tensor] = None,
+        kv_last_page_len_buf: Optional[torch.Tensor] = None,
+        sink_len: int = 4,
+        window_size: int = 2000,
+    ):
+        super().__init__(model_runner, skip_prefill, kv_indptr_buf, kv_last_page_len_buf)
+
+        self.sink_len = sink_len
+        self.window_size = window_size
+
+        jit_decl_batch = r"""
+        template <bool use_sliding_window, bool use_logits_soft_cap, bool use_alibi>
+        struct BatchAttentionSink : AttentionVariantBase {
+        static constexpr bool use_softmax = true;
+        uint32_t window_left;
+        float sm_scale_log2;
+
+        uint32_t sink_len, window_size;
+        uint32_t qo_len, kv_len;
+        uint8_t* custom_mask_ptr;
+
+        // Create closure
+        template <typename Params>
+        __device__ __host__ BatchAttentionSink(const Params& params, uint32_t batch_idx, uint8_t* smem_ptr) {
+            sink_len = params.sink_len;
+            window_size = params.window_size;
+            qo_len = params.get_qo_len(batch_idx);
+            kv_len = params.get_kv_len(batch_idx);
+            window_left = kv_len;
+            sm_scale_log2 = params.sm_scale * math::log2e;
+
+        }
+
+        // Logits mask to implement attention sink - this is where the main logic happens
+        REGISTER_LOGITS_MASK(params, batch_idx, qo_idx, kv_idx, qo_head_idx, kv_head_idx, {
+                bool mask = true;
+                // checking if the position (kv_idx) is not inferior to the token position minus the window size
+                // mask &= kv_idx  > ( (kv_len - qo_len) + qo_idx) ) - (window_size - sink_len);
+                mask &= (kv_idx + qo_len + (window_size - sink_len) > kv_len + qo_idx);
+                // checking if the position (kv_idx) is inferior to the sink length
+                mask |= (kv_idx < sink_len);
+                return mask;
+            })
+        };
+        """
+        from sglang.srt.configs.model_config import AttentionArch
+        if model_runner.model_config.attention_arch == AttentionArch.MLA:
+            raise NotImplementedError("MLA backend is not supported for sink attention at the moment")
+            hidden_dim_qk = model_runner.model_config.qk_nope_head_dim + model_runner.model_config.qk_rope_head_dim
+            hidden_dim_vo = model_runner.model_config.v_head_dim
+        else:
+            hidden_dim_qk = model_runner.model_config.head_dim
+            hidden_dim_vo = model_runner.model_config.head_dim
+
+        jit_args = (
+            "batch_attention_sink_decode",  # uri
+            model_runner.dtype,  # dtype_q
+            model_runner.kv_cache_dtype,  # dtype_kv
+            model_runner.dtype,  # dtype_o
+            torch.int32,  # idtype
+            hidden_dim_qk,  # hidden_dim_qk
+            hidden_dim_vo,  # hidden_dim_vo
+            [],  # additional_tensor_names
+            [],  # additional_tensor_dtypes
+            ["sink_len", "window_size", "sm_scale"],  # additional_scalar_names
+            ["int64_t", "int64_t", "double"],  # additional_scalar_dtypes
+            "BatchAttentionSink<false, false, false>",
+            jit_decl_batch,
+        )
+
+
+        # Parse constants
+        self.decode_use_tensor_cores = should_use_tensor_core(
+            kv_cache_dtype=model_runner.kv_cache_dtype,
+            num_attention_heads=model_runner.model_config.num_attention_heads
+            // get_attention_tp_size(),
+            num_kv_heads=model_runner.model_config.get_num_kv_heads(
+                get_attention_tp_size()
+            ),
+        )
+        self.max_context_len = model_runner.model_config.context_len
+        self.skip_prefill = skip_prefill
+        self.is_multimodal = model_runner.model_config.is_multimodal
+
+        assert not (
+            model_runner.sliding_window_size is not None
+            and model_runner.model_config.is_encoder_decoder
+        ), "Sliding window and cross attention are not supported together"
+
+        if model_runner.sliding_window_size is not None:
+            self.num_wrappers = 2
+            self.dispatch_reason = WrapperDispatch.SLIDING_WINDOW
+        elif model_runner.model_config.is_encoder_decoder:
+            self.num_wrappers = 2
+            self.dispatch_reason = WrapperDispatch.CROSS_ATTENTION
+        else:
+            self.num_wrappers = 1
+            self.dispatch_reason = None
+
+        # Qwen2/Qwen3 models require higher flashinfer workspace size
+        if (
+            "Qwen2ForCausalLM" in model_runner.model_config.hf_config.architectures
+            or "Qwen3ForCausalLM" in model_runner.model_config.hf_config.architectures
+            or "MiMoForCausalLM" in model_runner.model_config.hf_config.architectures
+        ):
+            global_config.flashinfer_workspace_size = 512 * 1024 * 1024
+
+        # Allocate buffers
+        global global_workspace_buffer
+        if global_workspace_buffer is None:
+            global_workspace_buffer = torch.empty(
+                global_config.flashinfer_workspace_size,
+                dtype=torch.uint8,
+                device=model_runner.device,
+            )
+        self.workspace_buffer = global_workspace_buffer
+        max_bs = model_runner.req_to_token_pool.size
+        if kv_indptr_buf is None:
+            self.kv_indptr = [
+                torch.zeros(
+                    (max_bs + 1,), dtype=torch.int32, device=model_runner.device
+                )
+                for _ in range(self.num_wrappers)
+            ]
+        else:
+            assert self.num_wrappers == 1
+            self.kv_indptr = [kv_indptr_buf]
+
+        if kv_last_page_len_buf is None:
+            self.kv_last_page_len = torch.ones(
+                (max_bs,), dtype=torch.int32, device=model_runner.device
+            )
+        else:
+            assert self.num_wrappers == 1
+            self.kv_last_page_len = kv_last_page_len_buf
+
+        if not self.skip_prefill:
+            self.qo_indptr = [
+                torch.zeros(
+                    (max_bs + 1,), dtype=torch.int32, device=model_runner.device
+                )
+                for _ in range(self.num_wrappers)
+            ]
+
+        fmha_backend = "auto"
+        if is_sm100_supported():
+            fmha_backend = "cutlass"
+        self.prefill_wrapper_ragged = BatchPrefillWithRaggedKVCacheWrapper(
+            self.workspace_buffer, "NHD", backend=fmha_backend
+        )
+
+        # Two wrappers: one for sliding window attention and one for full attention.
+        # Using two wrappers is unnecessary in the current PR, but are prepared for future PRs
+        self.prefill_wrappers_paged = []
+        self.prefill_wrappers_verify = []
+        self.decode_wrappers = []
+        for _ in range(self.num_wrappers):
+            if not skip_prefill:
+                self.prefill_wrappers_paged.append(
+                    BatchPrefillWithPagedKVCacheWrapper(
+                        self.workspace_buffer,
+                        "NHD",
+                        backend="fa2",
+                    )
+                )
+                self.prefill_wrappers_verify.append(
+                    BatchPrefillWithPagedKVCacheWrapper(
+                        self.workspace_buffer,
+                        "NHD",
+                    )
+                )
+            self.decode_wrappers.append(
+                BatchDecodeWithPagedKVCacheWrapper(
+                    self.workspace_buffer,
+                    "NHD",
+                    use_tensor_cores=self.decode_use_tensor_cores,
+                    jit_args=jit_args,
+                )
+            )
+
+        # Create indices updater
+        if not skip_prefill:
+            self.indices_updater_prefill = FlashInferIndicesUpdaterPrefill(
+                model_runner, self
+            )  # for verify
+        self.indices_updater_decode = FlashInferIndicesUpdaterDecode(model_runner, self)
+
+        # Other metadata
+        self.forward_metadata: Union[PrefillMetadata, DecodeMetadata] = None
+        self.decode_cuda_graph_metadata = {}
+        self.prefill_cuda_graph_metadata = {}  # For verify
+        self.draft_extend_cuda_graph_metadata = {}  # For draft extend
+
+    def forward_decode(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        layer: RadixAttention,
+        forward_batch: ForwardBatch,
+        save_kv_cache=True,
+    ):
+        decode_wrapper = self.forward_metadata.decode_wrappers[
+            self._get_wrapper_idx(layer)
+        ]
+        cache_loc = (
+            forward_batch.out_cache_loc
+            if not layer.is_cross_attention
+            else forward_batch.encoder_out_cache_loc
+        )
+
+        if k is not None:
+            assert v is not None
+            if save_kv_cache:
+                forward_batch.token_to_kv_pool.set_kv_buffer(
+                    layer, cache_loc, k, v, layer.k_scale, layer.v_scale
+                )
+
+        # Call the wrapped function
+        decode_wrapper._logits_soft_cap = layer.logit_cap
+        decode_wrapper._sm_scale = layer.scaling
+        o = decode_wrapper.run(
+            q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim),
+            forward_batch.token_to_kv_pool.get_kv_buffer(layer.layer_id),
+            self.sink_len,
+            self.window_size,
+            k_scale=layer.k_scale,
+            v_scale=layer.v_scale
+        )
+
+        # previous implementation, without JIT
+        # o = decode_wrapper.forward(
+        #     q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim),
+        #     forward_batch.token_to_kv_pool.get_kv_buffer(layer.layer_id),
+        #     sm_scale=layer.scaling,
+        #     logits_soft_cap=layer.logit_cap,
+        #     k_scale=layer.k_scale,
+        #     v_scale=layer.v_scale,
+        # )
+
+        return o.view(-1, layer.tp_q_head_num * layer.head_dim)
+
 
 class FlashInferIndicesUpdaterDecode:
     def __init__(self, model_runner: ModelRunner, attn_backend: AttentionBackend):
@@ -1036,6 +1283,7 @@ class FlashInferMultiStepDraftBackend:
         model_runner: ModelRunner,
         topk: int,
         speculative_num_steps: int,
+        seagle: bool = False, # whether to use seagle
     ):
         from sglang.srt.speculative.eagle_utils import generate_draft_decode_kv_indices
 
@@ -1059,7 +1307,7 @@ class FlashInferMultiStepDraftBackend:
         self.attn_backends = []
         for i in range(self.speculative_num_steps):
             self.attn_backends.append(
-                FlashInferAttnBackend(
+                FlashInferAttnBackend if not seagle else FlashInferAttnSinkBackend(
                     model_runner,
                     skip_prefill=True,
                     kv_indptr_buf=self.kv_indptr[i],

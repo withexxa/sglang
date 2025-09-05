@@ -1289,6 +1289,7 @@ class FlashInferMultiStepDraftBackend:
 
         self.topk = topk
         self.speculative_num_steps = speculative_num_steps
+        self.seagle = seagle
         self.generate_draft_decode_kv_indices = generate_draft_decode_kv_indices
         self.page_size = model_runner.page_size
 
@@ -1306,15 +1307,16 @@ class FlashInferMultiStepDraftBackend:
         )
         self.attn_backends = []
         for i in range(self.speculative_num_steps):
+            selected_backend = FlashInferAttnBackend if not self.seagle else FlashInferAttnSinkBackend
             self.attn_backends.append(
-                FlashInferAttnBackend if not seagle else FlashInferAttnSinkBackend(
+                selected_backend(
                     model_runner,
                     skip_prefill=True,
                     kv_indptr_buf=self.kv_indptr[i],
                     kv_last_page_len_buf=self.kv_last_page_len,
                 )
             )
-
+        print(f"FlashInferMultiStepDraftBackend: {self.attn_backends[0]}, seagle activated: {self.seagle}")
         self.max_context_len = self.attn_backends[0].max_context_len
 
         # Cached variables for generate_draft_decode_kv_indices

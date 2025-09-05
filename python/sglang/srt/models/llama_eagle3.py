@@ -49,7 +49,7 @@ class LlamaDecoderLayer(LlamaDecoderLayer):
     ) -> None:
         super().__init__(config, layer_id, quant_config, prefix)
 
-        # override qkv
+        # override qkv (was only 1 * hidden_size, bias was config dependent)
         self.self_attn.qkv_proj = QKVParallelLinear(
             2 * self.hidden_size,
             self.self_attn.head_dim,
